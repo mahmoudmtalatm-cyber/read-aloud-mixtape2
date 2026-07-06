@@ -394,6 +394,26 @@
     margin-top: 8px;
     min-height: 16px;
   }
+
+  .voice-row{
+    display:flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .voice-row select{ flex: 1; }
+  .voice-row #previewVoiceBtn{
+    flex-shrink: 0;
+    white-space: nowrap;
+    padding: 0 14px;
+  }
+  .preview-status{
+    font-size: 11.5px;
+    color: var(--paper-dim);
+    margin-top: 6px;
+    min-height: 14px;
+  }
+  .preview-status.err{ color: var(--rose); }
+  .preview-status.ok{ color: var(--mint); }
 </style>
 </head>
 <body>
@@ -452,38 +472,43 @@
       </div>
       <div class="field">
         <label class="field-label" for="voiceSelect">VOICE (single narrator)</label>
-        <select id="voiceSelect">
-          <option value="Kore">Kore</option>
-          <option value="Puck">Puck</option>
-          <option value="Charon">Charon</option>
-          <option value="Zephyr">Zephyr</option>
-          <option value="Fenrir">Fenrir</option>
-          <option value="Leda">Leda</option>
-          <option value="Orus">Orus</option>
-          <option value="Aoede">Aoede</option>
-          <option value="Callirrhoe">Callirrhoe</option>
-          <option value="Autonoe">Autonoe</option>
-          <option value="Enceladus">Enceladus</option>
-          <option value="Iapetus">Iapetus</option>
-          <option value="Umbriel">Umbriel</option>
-          <option value="Algieba">Algieba</option>
-          <option value="Despina">Despina</option>
-          <option value="Erinome">Erinome</option>
-          <option value="Algenib">Algenib</option>
-          <option value="Rasalgethi">Rasalgethi</option>
-          <option value="Laomedeia">Laomedeia</option>
-          <option value="Achernar">Achernar</option>
-          <option value="Alnilam">Alnilam</option>
-          <option value="Schedar">Schedar</option>
-          <option value="Gacrux">Gacrux</option>
-          <option value="Pulcherrima">Pulcherrima</option>
-          <option value="Achird">Achird</option>
-          <option value="Zubenelgenubi">Zubenelgenubi</option>
-          <option value="Vindemiatrix">Vindemiatrix</option>
-          <option value="Sadachbia">Sadachbia</option>
-          <option value="Sadaltager">Sadaltager</option>
-          <option value="Sulafat">Sulafat</option>
-        </select>
+        <div class="voice-row">
+          <select id="voiceSelect">
+            <option value="Kore">Kore</option>
+            <option value="Puck">Puck</option>
+            <option value="Charon">Charon</option>
+            <option value="Zephyr">Zephyr</option>
+            <option value="Fenrir">Fenrir</option>
+            <option value="Leda">Leda</option>
+            <option value="Orus">Orus</option>
+            <option value="Aoede">Aoede</option>
+            <option value="Callirrhoe">Callirrhoe</option>
+            <option value="Autonoe">Autonoe</option>
+            <option value="Enceladus">Enceladus</option>
+            <option value="Iapetus">Iapetus</option>
+            <option value="Umbriel">Umbriel</option>
+            <option value="Algieba">Algieba</option>
+            <option value="Despina">Despina</option>
+            <option value="Erinome">Erinome</option>
+            <option value="Algenib">Algenib</option>
+            <option value="Rasalgethi">Rasalgethi</option>
+            <option value="Laomedeia">Laomedeia</option>
+            <option value="Achernar">Achernar</option>
+            <option value="Alnilam">Alnilam</option>
+            <option value="Schedar">Schedar</option>
+            <option value="Gacrux">Gacrux</option>
+            <option value="Pulcherrima">Pulcherrima</option>
+            <option value="Achird">Achird</option>
+            <option value="Zubenelgenubi">Zubenelgenubi</option>
+            <option value="Vindemiatrix">Vindemiatrix</option>
+            <option value="Sadachbia">Sadachbia</option>
+            <option value="Sadaltager">Sadaltager</option>
+            <option value="Sulafat">Sulafat</option>
+          </select>
+          <button type="button" class="btn-secondary" id="previewVoiceBtn" title="Hear a short sample of this voice">▶ Preview</button>
+        </div>
+        <div class="preview-status mono" id="previewStatus"></div>
+        <audio id="previewPlayer" style="display:none;"></audio>
       </div>
     </div>
 
@@ -575,27 +600,40 @@
   let pdfEngineReady = false;
   let pdfEngineLoading = null;
 
+  // NOTE: pdf.js 4.x dropped classic UMD/<script> builds (they only ship
+  // ES modules now, e.g. pdf.mjs), so pdf.min.js 404s on every CDN for 4.x —
+  // that was the actual bug, not a network/ad-blocker issue. 3.11.174 is the
+  // last release with classic .min.js builds, so we pin to that for the
+  // plain <script> loader below. cdnjs uses a flat file layout; jsDelivr/
+  // unpkg mirror the npm package layout (files live under legacy/build/).
   const PDF_JS_SOURCES = [
     {
-      lib: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js",
-      worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js"
+      lib: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+      worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"
     },
     {
-      lib: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.js",
-      worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.js"
+      lib: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js",
+      worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js"
     },
     {
-      lib: "https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.min.js",
-      worker: "https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.worker.min.js"
+      lib: "https://unpkg.com/pdfjs-dist@3.11.174/legacy/build/pdf.min.js",
+      worker: "https://unpkg.com/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js"
     }
   ];
 
-  function loadScript(src) {
+  function loadScript(src, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        s.remove();
+        reject(new Error('timed out loading ' + src));
+      }, timeoutMs);
       s.src = src;
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error('failed to load ' + src));
+      s.onload = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+      s.onerror = () => { if (settled) return; settled = true; clearTimeout(timer); reject(new Error('failed to load ' + src)); };
       document.head.appendChild(s);
     });
   }
@@ -605,6 +643,7 @@
     if (pdfEngineLoading) return pdfEngineLoading;
 
     pdfEngineLoading = (async () => {
+      const failures = [];
       for (const source of PDF_JS_SOURCES) {
         try {
           if (typeof pdfjsLib === 'undefined') {
@@ -617,9 +656,10 @@
           }
         } catch (e) {
           console.warn('pdf.js source failed, trying next:', source.lib, e);
+          failures.push(source.lib);
         }
       }
-      console.warn('pdf.js did not load from any source — PDF uploads will show a friendly error; text/.txt files and pasting still work.');
+      console.warn('pdf.js did not load from any source — PDF uploads will show a friendly error; text/.txt files and pasting still work.', failures);
       return false;
     })();
 
@@ -652,6 +692,9 @@
   const downloadLink = document.getElementById('downloadLink');
   const resetBtn = document.getElementById('resetBtn');
   const errorBanner = document.getElementById('errorBanner');
+  const previewVoiceBtn = document.getElementById('previewVoiceBtn');
+  const previewStatus = document.getElementById('previewStatus');
+  const previewPlayer = document.getElementById('previewPlayer');
 
   // --- multi-key management ---
   function createKeyRow(value) {
@@ -1097,6 +1140,55 @@
     goBtn.textContent = '▶ Start recording';
     finalizeAudio(job);
   });
+
+  // --- voice preview ---
+  // Short sample line per voice so people can hear tone/pacing before
+  // committing to a full recording. Uses WAV (not mp3) for playback since
+  // it needs no encoding step — just the raw PCM bytes wrapped in a header —
+  // so the preview comes back and plays almost immediately.
+  const PREVIEW_SAMPLE_TEXT = "Hi there — this is a quick sample of this narrator voice, so you can hear how it sounds before recording your full piece.";
+  let previewIsRunning = false;
+
+  function setPreviewStatus(msg, cls) {
+    previewStatus.textContent = msg || '';
+    previewStatus.className = 'preview-status mono' + (cls ? ' ' + cls : '');
+  }
+
+  previewVoiceBtn.addEventListener('click', async () => {
+    if (previewIsRunning) return;
+
+    const apiKeys = getApiKeys();
+    if (!apiKeys.length) {
+      setPreviewStatus('Paste at least one Gemini API key first to preview a voice.', 'err');
+      return;
+    }
+
+    previewIsRunning = true;
+    previewVoiceBtn.disabled = true;
+    previewVoiceBtn.textContent = '● Loading…';
+    setPreviewStatus('Generating sample…');
+
+    try {
+      const model = modelSelect.value;
+      const voice = voiceSelect.value;
+      const prompt = buildPrompt(PREVIEW_SAMPLE_TEXT, '');
+      const { bytes, sampleRate } = await callTTS(model, apiKeys[0], prompt, voice, { pieceLabel: 'Voice preview' });
+      const wavBlob = pcmToWavBlob(bytes, sampleRate, 1, 16);
+      const url = URL.createObjectURL(wavBlob);
+      previewPlayer.src = url;
+      await previewPlayer.play();
+      setPreviewStatus(`Playing "${voice}"…`, 'ok');
+    } catch (err) {
+      setPreviewStatus('Could not preview that voice: ' + err.message, 'err');
+    } finally {
+      previewIsRunning = false;
+      previewVoiceBtn.disabled = false;
+      previewVoiceBtn.textContent = '▶ Preview';
+    }
+  });
+
+  // clear the "Playing…" status once the sample actually finishes
+  previewPlayer.addEventListener('ended', () => setPreviewStatus(''));
 
   resetBtn.addEventListener('click', () => {
     job = null;
