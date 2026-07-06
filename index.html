@@ -1291,9 +1291,11 @@
 
   function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
-  // --- Gemini TTS call with retry on rate limits ---
-  async function callTTS(model, apiKey, promptText, voice, options = {}) {
-    const { attempt = 1, maxAttempts = 6, pieceLabel = '', seed = null } = options;
+  // --- Gemini TTS: single attempt, no retry logic in here ---
+  // Throws typed errors (err.type) so callers can decide what "failure" actually
+  // means: a rate limit isn't the same problem as a real safety block, and both
+  // are different from a transient server hiccup — each needs different handling.
+  async function callTTSOnce(model, apiKey, promptText, voice, seed) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const body = {
       contents: [{ parts: [{ text: promptText }] }],
@@ -1307,47 +1309,103 @@
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
       }
     };
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
 
-    if (res.status === 429) {
-      if (attempt >= maxAttempts) {
-        throw new Error(`Still rate limited after several tries over about a minute. Wait a little longer, then click "Retry failed pieces".`);
-      }
-      // Honor the server's Retry-After if it sends one; otherwise back off
-      // progressively (10s, 20s, 30s, 30s, 30s...) which comfortably covers
-      // typical free-tier per-minute quotas without needing a manual retry.
-      let waitMs = 0;
-      const retryAfter = res.headers.get('Retry-After');
-      if (retryAfter) {
-        const asSeconds = Number(retryAfter);
-        waitMs = !isNaN(asSeconds) ? asSeconds * 1000 : Math.max(0, new Date(retryAfter).getTime() - Date.now());
-      }
-      if (!waitMs) waitMs = Math.min(attempt * 10000, 30000);
-
-      if (pieceLabel) logLine(`${pieceLabel} rate-limited — waiting ${Math.round(waitMs / 1000)}s before retry (attempt ${attempt + 1}/${maxAttempts})…`);
-      await sleep(waitMs);
-      return callTTS(model, apiKey, promptText, voice, { attempt: attempt + 1, maxAttempts, pieceLabel, seed });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    } catch (networkErr) {
+      const e = new Error('Network error reaching the API — check your connection.');
+      e.type = 'network';
+      throw e;
     }
 
     if (!res.ok) {
       let message = `Request failed (${res.status})`;
-      try { const errJson = await res.json(); if (errJson?.error?.message) message = errJson.error.message; } catch (_) {}
-      throw new Error(message);
+      let apiStatus = '';
+      try {
+        const errJson = await res.json();
+        if (errJson?.error?.message) message = errJson.error.message;
+        if (errJson?.error?.status) apiStatus = errJson.error.status;
+      } catch (_) {}
+
+      const e = new Error(message);
+      if (res.status === 429) {
+        e.type = 'rate_limit';
+        const retryAfter = res.headers.get('Retry-After');
+        if (retryAfter) {
+          const asSeconds = Number(retryAfter);
+          e.retryAfterMs = !isNaN(asSeconds) ? asSeconds * 1000 : Math.max(0, new Date(retryAfter).getTime() - Date.now());
+        }
+      } else if (res.status === 403 || (res.status === 400 && /api key not valid/i.test(message))) {
+        // Bad/expired/revoked key — retrying will never help, so callers should
+        // stop sending this key entirely rather than burning attempts on it.
+        e.type = 'invalid_key';
+      } else if (res.status >= 500) {
+        // Google's "an internal error has occurred" lands here — this is almost
+        // always transient and worth a short-backoff retry, not a hard failure.
+        e.type = 'server_error';
+      } else {
+        e.type = 'other';
+      }
+      throw e;
     }
 
     const json = await res.json();
-    const part = json?.candidates?.[0]?.content?.parts?.[0];
+    const candidate = json?.candidates?.[0];
+    const part = candidate?.content?.parts?.[0];
+
     if (!part?.inlineData?.data) {
-      throw new Error('No audio came back for this piece — it may have been blocked or empty.');
+      // Inspect *why* it's empty instead of reporting one generic message for
+      // every case — a real safety block needs different advice than a
+      // one-off empty response that would likely succeed on retry.
+      const blockReason = json?.promptFeedback?.blockReason;
+      const finishReason = candidate?.finishReason;
+      const e = new Error('No audio came back for this piece — it may have been blocked or empty.');
+      if (blockReason || finishReason === 'SAFETY' || finishReason === 'PROHIBITED_CONTENT') {
+        e.message = `This piece was blocked by the API's safety filters (${blockReason || finishReason}). Try rewording this section — retrying as-is won't help.`;
+        e.type = 'blocked';
+      } else if (finishReason === 'RECITATION') {
+        e.message = 'This piece was blocked for resembling copyrighted text too closely. Try rewording it.';
+        e.type = 'blocked';
+      } else if (finishReason) {
+        e.message = `No audio came back for this piece (reason: ${finishReason}).`;
+        e.type = 'no_audio_transient';
+      } else {
+        e.type = 'no_audio_transient';
+      }
+      throw e;
     }
+
     const mimeType = part.inlineData.mimeType || '';
     const rateMatch = mimeType.match(/rate=(\d+)/);
     const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
     return { bytes: base64ToUint8Array(part.inlineData.data), sampleRate };
+  }
+
+  // --- Same-key retry wrapper (used by the single-key voice preview) ---
+  async function callTTS(model, apiKey, promptText, voice, options = {}) {
+    const { attempt = 1, maxAttempts = 6, pieceLabel = '', seed = null } = options;
+    try {
+      return await callTTSOnce(model, apiKey, promptText, voice, seed);
+    } catch (err) {
+      const retryable = err.type === 'rate_limit' || err.type === 'server_error' ||
+                         err.type === 'no_audio_transient' || err.type === 'network';
+      if (!retryable || attempt >= maxAttempts) throw err;
+
+      let waitMs = err.retryAfterMs || 0;
+      if (!waitMs) waitMs = err.type === 'rate_limit' ? Math.min(attempt * 10000, 30000) : Math.min(attempt * 2000, 8000);
+
+      if (pieceLabel) {
+        const reason = err.type === 'rate_limit' ? 'rate-limited' : err.type === 'server_error' ? 'hit a server error' : 'came back empty';
+        logLine(`${pieceLabel} ${reason} — waiting ${Math.round(waitMs / 1000)}s before retry (attempt ${attempt + 1}/${maxAttempts})…`);
+      }
+      await sleep(waitMs);
+      return callTTS(model, apiKey, promptText, voice, { attempt: attempt + 1, maxAttempts, pieceLabel, seed });
+    }
   }
 
   function buildPrompt(chunkText, extraNotes) {
@@ -1431,39 +1489,118 @@
     return true;
   }
 
+  // --- Shared key pool: keys are a resource pool, not bound to one worker ---
+  // Instead of pinning each worker to a single API key (so a rate-limited key
+  // stalls that whole worker), every worker pulls whichever key is currently
+  // available. A rate-limited key goes on a timed cooldown in the background
+  // while work keeps flowing through the other keys — so N keys keep roughly
+  // N pieces moving even while some keys are cooling down on a 429.
+  function createKeyPool(keys) {
+    const entries = keys.map(k => ({ key: k, availableAt: 0, disabled: false }));
+    return {
+      entries,
+      async acquire() {
+        while (true) {
+          const usable = entries.filter(e => !e.disabled);
+          if (!usable.length) {
+            const e = new Error('All API keys have been disabled (invalid, or rejected by the API).');
+            e.type = 'no_keys';
+            throw e;
+          }
+          usable.sort((a, b) => a.availableAt - b.availableAt);
+          const pick = usable[0];
+          const now = Date.now();
+          if (pick.availableAt <= now) {
+            // small reservation so two workers don't both grab the same
+            // just-freed key in the same tick before it's actually used
+            pick.availableAt = now + 500;
+            return pick;
+          }
+          await sleep(Math.min(pick.availableAt - now, 4000));
+        }
+      },
+      cooldown(entry, ms) { entry.availableAt = Date.now() + Math.max(0, ms); },
+      disable(entry) { entry.disabled = true; }
+    };
+  }
+
+  // Generates one piece, rotating across the key pool as needed. A rate limit
+  // or bad key switches to the next available key immediately rather than
+  // blocking; a server error gets a short same-key retry (it's usually
+  // transient); a genuine safety block stops retrying since another attempt
+  // won't change the outcome.
+  async function generatePieceWithRotation(j, idx, pool, pieceLabel) {
+    const prompt = buildPrompt(j.chunks[idx], j.notes);
+    const maxAttempts = Math.max(6, pool.entries.length * 3);
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const entry = await pool.acquire();
+      try {
+        const result = await callTTSOnce(j.model, entry.key, prompt, j.voice, j.seed);
+        pool.cooldown(entry, 0);
+        return result;
+      } catch (err) {
+        lastErr = err;
+        const keyTag = entry.key.length > 4 ? entry.key.slice(-4) : entry.key;
+        if (err.type === 'rate_limit') {
+          pool.cooldown(entry, err.retryAfterMs || 20000);
+          logLine(`${pieceLabel}: key …${keyTag} is rate-limited — switching to another key…`);
+          continue;
+        }
+        if (err.type === 'invalid_key') {
+          pool.disable(entry);
+          logLine(`${pieceLabel}: key …${keyTag} was rejected by the API and has been disabled for this job.`, 'err');
+          continue;
+        }
+        if (err.type === 'server_error' || err.type === 'no_audio_transient' || err.type === 'network') {
+          pool.cooldown(entry, Math.min(attempt * 2000, 8000));
+          continue;
+        }
+        // 'blocked' (safety/recitation) or unknown — permanent for this
+        // content, so stop burning through every key on a lost cause.
+        pool.cooldown(entry, 0);
+        throw err;
+      }
+    }
+    throw lastErr || new Error('Could not generate this piece after several attempts.');
+  }
+
   async function runJob(j, apiKeys) {
     const pendingIndices = j.chunks
       .map((_, i) => i)
       .filter(i => j.status[i] !== 'done');
 
+    const pool = createKeyPool(apiKeys);
+    const concurrency = Math.max(1, Math.min(apiKeys.length, pendingIndices.length));
     let cursor = 0;
-    async function worker(apiKey) {
+
+    async function worker() {
       while (true) {
         const myTurn = cursor++;
         if (myTurn >= pendingIndices.length) return;
         const idx = pendingIndices[myTurn];
         j.status[idx] = 'in-progress';
         renderProgress(j);
+        const pieceLabel = `Piece ${idx + 1}`;
         logLine(`Recording piece ${idx + 1} of ${j.chunks.length}…`);
         try {
-          const prompt = buildPrompt(j.chunks[idx], j.notes);
-          const { bytes, sampleRate } = await callTTS(j.model, apiKey, prompt, j.voice, { pieceLabel: `Piece ${idx + 1}`, seed: j.seed });
+          const { bytes, sampleRate } = await generatePieceWithRotation(j, idx, pool, pieceLabel);
           j.results[idx] = { bytes, sampleRate };
           j.status[idx] = 'done';
-          logLine(`Piece ${idx + 1} done.`, 'ok');
+          logLine(`${pieceLabel} done.`, 'ok');
         } catch (err) {
           j.status[idx] = 'failed';
-          logLine(`Piece ${idx + 1} failed: ${err.message}`, 'err');
+          logLine(`${pieceLabel} failed: ${err.message}`, 'err');
         }
         renderProgress(j);
-        // gentle pacing per key so a single key doesn't hammer the free tier
-        if (cursor < pendingIndices.length) await sleep(600);
       }
     }
 
-    // one worker per API key — they pull from the shared queue concurrently,
-    // so N keys process roughly N pieces at once instead of one at a time
-    await Promise.all(apiKeys.map(key => worker(key)));
+    // Concurrency is capped by key count, but workers are NOT bound to a
+    // specific key — they share the pool so a slow/cooling-down key doesn't
+    // stall a whole worker while other keys sit idle.
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
   }
 
   goBtn.addEventListener('click', async () => {
