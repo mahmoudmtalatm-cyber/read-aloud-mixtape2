@@ -196,8 +196,13 @@
     display:flex;
     gap: 10px;
     align-items: center;
+    margin-bottom: 8px;
   }
   .key-row input{ flex:1; }
+  .key-row .remove-key-btn{
+    padding: 10px 12px;
+    flex-shrink: 0;
+  }
 
   .checkline{
     display:flex;
@@ -493,18 +498,17 @@
     </div>
 
     <div class="field" style="margin-top:18px;">
-      <label class="field-label" for="apiKey">GEMINI API KEY</label>
-      <div class="key-row">
-        <input type="password" id="apiKey" placeholder="Paste your API key here" />
-        <button type="button" class="btn-secondary" id="toggleKey">Show</button>
-      </div>
+      <label class="field-label">GEMINI API KEY(S)</label>
+      <div id="apiKeysList"></div>
+      <button type="button" class="btn-secondary" id="addKeyBtn" style="margin-top:2px;">+ Add another key</button>
       <div class="checkline">
         <input type="checkbox" id="rememberKey" />
-        <label for="rememberKey">Remember this key on this device only</label>
+        <label for="rememberKey">Remember these keys on this device only</label>
       </div>
       <div class="keyhint">
-        Your key is used only to call Google's API directly from your browser — it never passes through any other server.
-        Don't paste it into shared or public computers. Get a free key at
+        Add more than one key to work on several pieces at the same time — each key records a different piece in parallel, so longer documents finish faster.
+        Keys are used only to call Google's API directly from your browser — they never pass through any other server.
+        Don't paste them into shared or public computers. Get a free key at
         <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.
       </div>
     </div>
@@ -554,36 +558,86 @@
   </section>
 
   <footer>
-    This page runs entirely in your browser and calls Google's Gemini API directly with the key you provide.
-    Free-tier keys have rate limits — if a piece fails with a "rate limited" message, wait a minute and it will retry automatically.
-    Long documents are split into short pieces and stitched back into one file so playback stays in order.
+    This page runs entirely in your browser and calls Google's Gemini API directly with the keys you provide.
+    Add multiple keys to work on several pieces at once and finish faster. Free-tier keys have rate limits — if a piece fails, only that piece needs a retry; press "Retry failed pieces" and the rest won't be redone.
+    Long documents are split into short pieces and stitched back into one file in the original order, however they finished.
   </footer>
 
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js"></script>
 <script>
   // Guard against the PDF engine failing to load (blocked script, offline, etc.)
   // so the rest of the app still works — only PDF extraction is affected.
+  // Tries multiple CDNs in sequence (one being blocked, e.g. by an ad-blocker
+  // or corporate proxy, shouldn't permanently disable PDF support), and can
+  // be retried on demand the moment a user actually drops a PDF.
   let pdfEngineReady = false;
-  try {
-    if (typeof pdfjsLib !== 'undefined') {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js";
-      pdfEngineReady = true;
-    } else {
-      console.warn('pdf.js did not load — PDF uploads will show a friendly error; text/.txt files and pasting still work.');
+  let pdfEngineLoading = null;
+
+  const PDF_JS_SOURCES = [
+    {
+      lib: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js",
+      worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js"
+    },
+    {
+      lib: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.js",
+      worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.js"
+    },
+    {
+      lib: "https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.min.js",
+      worker: "https://unpkg.com/pdfjs-dist@4.0.379/build/pdf.worker.min.js"
     }
-  } catch (e) {
-    console.warn('pdf.js setup failed:', e);
+  ];
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('failed to load ' + src));
+      document.head.appendChild(s);
+    });
   }
+
+  async function ensurePdfEngine() {
+    if (pdfEngineReady) return true;
+    if (pdfEngineLoading) return pdfEngineLoading;
+
+    pdfEngineLoading = (async () => {
+      for (const source of PDF_JS_SOURCES) {
+        try {
+          if (typeof pdfjsLib === 'undefined') {
+            await loadScript(source.lib);
+          }
+          if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = source.worker;
+            pdfEngineReady = true;
+            return true;
+          }
+        } catch (e) {
+          console.warn('pdf.js source failed, trying next:', source.lib, e);
+        }
+      }
+      console.warn('pdf.js did not load from any source — PDF uploads will show a friendly error; text/.txt files and pasting still work.');
+      return false;
+    })();
+
+    const result = await pdfEngineLoading;
+    pdfEngineLoading = null;
+    return result;
+  }
+
+  // Kick off loading eagerly in the background so it's usually ready by the
+  // time a user picks a file, without blocking the rest of the page.
+  ensurePdfEngine();
 
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
   const textArea = document.getElementById('textArea');
   const estimate = document.getElementById('estimate');
   const notesArea = document.getElementById('notesArea');
-  const apiKeyInput = document.getElementById('apiKey');
-  const toggleKeyBtn = document.getElementById('toggleKey');
+  const apiKeysList = document.getElementById('apiKeysList');
+  const addKeyBtn = document.getElementById('addKeyBtn');
   const rememberKey = document.getElementById('rememberKey');
   const modelSelect = document.getElementById('modelSelect');
   const voiceSelect = document.getElementById('voiceSelect');
@@ -598,21 +652,88 @@
   const resetBtn = document.getElementById('resetBtn');
   const errorBanner = document.getElementById('errorBanner');
 
-  // --- restore remembered key ---
-  const savedKey = localStorage.getItem('ram_gemini_key');
-  if (savedKey) {
-    apiKeyInput.value = savedKey;
-    rememberKey.checked = true;
+  // --- multi-key management ---
+  function createKeyRow(value) {
+    const row = document.createElement('div');
+    row.className = 'key-row';
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.className = 'apiKeyInput';
+    input.placeholder = 'Paste your API key here';
+    if (value) input.value = value;
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.className = 'btn-secondary toggle-key-btn';
+    toggleBtn.textContent = 'Show';
+    toggleBtn.addEventListener('click', () => {
+      const isPwd = input.type === 'password';
+      input.type = isPwd ? 'text' : 'password';
+      toggleBtn.textContent = isPwd ? 'Hide' : 'Show';
+    });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'btn-secondary remove-key-btn';
+    removeBtn.title = 'Remove this key';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', () => {
+      if (apiKeysList.querySelectorAll('.key-row').length <= 1) {
+        input.value = '';
+        return;
+      }
+      row.remove();
+      updateRemoveButtonVisibility();
+    });
+
+    row.appendChild(input);
+    row.appendChild(toggleBtn);
+    row.appendChild(removeBtn);
+    apiKeysList.appendChild(row);
+    updateRemoveButtonVisibility();
   }
+
+  function updateRemoveButtonVisibility() {
+    const rows = apiKeysList.querySelectorAll('.key-row');
+    rows.forEach(r => {
+      r.querySelector('.remove-key-btn').style.visibility = rows.length > 1 ? 'visible' : 'hidden';
+    });
+  }
+
+  function getApiKeys() {
+    return [...apiKeysList.querySelectorAll('.apiKeyInput')]
+      .map(i => i.value.trim())
+      .filter(Boolean);
+  }
+
+  addKeyBtn.addEventListener('click', () => createKeyRow());
+
+  // --- restore remembered keys (migrates the old single-key format too) ---
+  (function restoreKeys() {
+    let saved = [];
+    const savedList = localStorage.getItem('ram_gemini_keys');
+    if (savedList) {
+      try { const parsed = JSON.parse(savedList); if (Array.isArray(parsed)) saved = parsed; } catch (_) {}
+    } else {
+      const legacy = localStorage.getItem('ram_gemini_key');
+      if (legacy) saved = [legacy];
+    }
+    if (saved.length) {
+      saved.forEach(k => createKeyRow(k));
+      rememberKey.checked = true;
+    } else {
+      createKeyRow();
+    }
+  })();
+
   rememberKey.addEventListener('change', () => {
-    if (!rememberKey.checked) localStorage.removeItem('ram_gemini_key');
+    if (!rememberKey.checked) {
+      localStorage.removeItem('ram_gemini_keys');
+      localStorage.removeItem('ram_gemini_key');
+    }
   });
 
-  toggleKeyBtn.addEventListener('click', () => {
-    const isPwd = apiKeyInput.type === 'password';
-    apiKeyInput.type = isPwd ? 'text' : 'password';
-    toggleKeyBtn.textContent = isPwd ? 'Hide' : 'Show';
-  });
 
   // --- quick-add note chips ---
   document.querySelectorAll('.chip').forEach(chip => {
@@ -650,7 +771,10 @@
 
   async function extractPdfText(file) {
     if (!pdfEngineReady) {
-      throw new Error('The PDF reader couldn\'t load (often a connection or ad-blocker issue). Try reloading the page, or open the PDF yourself and paste the text in instead.');
+      const ready = await ensurePdfEngine();
+      if (!ready) {
+        throw new Error('The PDF reader couldn\'t load from any source (often a connection or ad-blocker issue). Try reloading the page, or open the PDF yourself and paste the text in instead.');
+      }
     }
     const buf = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
@@ -744,7 +868,8 @@
   function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
   // --- Gemini TTS call with retry on rate limits ---
-  async function callTTS(model, apiKey, promptText, voice, attempt = 1) {
+  async function callTTS(model, apiKey, promptText, voice, options = {}) {
+    const { attempt = 1, maxAttempts = 6, pieceLabel = '' } = options;
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const body = {
       contents: [{ parts: [{ text: promptText }] }],
@@ -760,9 +885,23 @@
     });
 
     if (res.status === 429) {
-      if (attempt >= 4) throw new Error('Still rate limited after several tries. Wait a minute, then press "Start recording" again.');
-      await sleep(attempt * 3000);
-      return callTTS(model, apiKey, promptText, voice, attempt + 1);
+      if (attempt >= maxAttempts) {
+        throw new Error(`Still rate limited after several tries over about a minute. Wait a little longer, then click "Retry failed pieces".`);
+      }
+      // Honor the server's Retry-After if it sends one; otherwise back off
+      // progressively (10s, 20s, 30s, 30s, 30s...) which comfortably covers
+      // typical free-tier per-minute quotas without needing a manual retry.
+      let waitMs = 0;
+      const retryAfter = res.headers.get('Retry-After');
+      if (retryAfter) {
+        const asSeconds = Number(retryAfter);
+        waitMs = !isNaN(asSeconds) ? asSeconds * 1000 : Math.max(0, new Date(retryAfter).getTime() - Date.now());
+      }
+      if (!waitMs) waitMs = Math.min(attempt * 10000, 30000);
+
+      if (pieceLabel) logLine(`${pieceLabel} rate-limited — waiting ${Math.round(waitMs / 1000)}s before retry (attempt ${attempt + 1}/${maxAttempts})…`);
+      await sleep(waitMs);
+      return callTTS(model, apiKey, promptText, voice, { attempt: attempt + 1, maxAttempts, pieceLabel });
     }
 
     if (!res.ok) {
@@ -804,80 +943,152 @@
   }
 
   // --- main generate flow ---
+  // `job` persists between clicks so a failure only leaves the failed/missing
+  // pieces to redo — it does not throw away pieces that already succeeded.
+  // A new job is only started when the source text actually changes.
+  let job = null;
   let isRunning = false;
 
-  goBtn.addEventListener('click', async () => {
-    if (isRunning) return;
-    showError('');
-    resultEl.classList.remove('show');
-
-    const text = textArea.value.trim();
-    const apiKey = apiKeyInput.value.trim();
-    const model = modelSelect.value;
-    const voice = voiceSelect.value;
-    const notes = notesArea.value;
-
-    if (!text) { showError('Add some text first — paste it in, or upload a file above.'); return; }
-    if (!apiKey) { showError('Paste your Gemini API key first. Get a free one at aistudio.google.com/apikey.'); return; }
-
-    if (rememberKey.checked) localStorage.setItem('ram_gemini_key', apiKey);
-
+  function buildFreshJob(text, notes, model, voice) {
     const chunks = splitIntoChunks(text);
-    if (!chunks.length) { showError('Could not find any text to read.'); return; }
+    return {
+      sourceText: text,
+      notes, model, voice,
+      chunks,
+      results: new Array(chunks.length).fill(null),   // {bytes, sampleRate} once done
+      status: new Array(chunks.length).fill('pending') // 'pending' | 'in-progress' | 'done' | 'failed'
+    };
+  }
 
-    isRunning = true;
-    goBtn.disabled = true;
-    goBtn.textContent = '● Recording…';
-    stage.classList.add('spinning');
-    logEl.innerHTML = '';
-    progressFill.style.width = '0%';
+  function jobCounts(j) {
+    const done = j.status.filter(s => s === 'done').length;
+    const failed = j.status.filter(s => s === 'failed').length;
+    return { done, failed, total: j.chunks.length };
+  }
 
-    const pcmPieces = [];
-    let sampleRate = 24000;
-    let failed = false;
+  function renderProgress(j) {
+    const { done, failed, total } = jobCounts(j);
+    counter.textContent = `TAPE COUNTER · ${String(done).padStart(3, '0')} / ${String(total).padStart(3, '0')}` +
+      (failed ? ` (${failed} failed)` : '');
+    progressFill.style.width = `${Math.round((done / total) * 100)}%`;
+  }
 
-    for (let i = 0; i < chunks.length; i++) {
-      counter.textContent = `TAPE COUNTER · ${String(i + 1).padStart(3, '0')} / ${String(chunks.length).padStart(3, '0')}`;
-      logLine(`Recording piece ${i + 1} of ${chunks.length}…`);
-      try {
-        const prompt = buildPrompt(chunks[i], notes);
-        const { bytes, sampleRate: sr } = await callTTS(model, apiKey, prompt, voice);
-        sampleRate = sr;
-        pcmPieces.push(bytes);
-        logLine(`Piece ${i + 1} done.`, 'ok');
-      } catch (err) {
-        logLine(`Piece ${i + 1} failed: ${err.message}`, 'err');
-        showError(`Piece ${i + 1} of ${chunks.length} failed: ${err.message}`);
-        failed = true;
-        break;
-      }
-      progressFill.style.width = `${Math.round(((i + 1) / chunks.length) * 100)}%`;
-      if (i < chunks.length - 1) await sleep(1200); // gentle pacing for free-tier rate limits
-    }
-
-    stage.classList.remove('spinning');
-    goBtn.disabled = false;
-    goBtn.textContent = '▶ Start recording';
-    isRunning = false;
-
-    if (failed || pcmPieces.length === 0) return;
-
-    const fullPcm = concatUint8Arrays(pcmPieces);
+  function finalizeAudio(j) {
+    const orderedResults = j.results;
+    if (orderedResults.some(r => !r)) return false;
+    const sampleRate = orderedResults.find(r => r)?.sampleRate || 24000;
+    const fullPcm = concatUint8Arrays(orderedResults.map(r => r.bytes));
     const wavBlob = pcmToWavBlob(fullPcm, sampleRate, 1, 16);
     const url = URL.createObjectURL(wavBlob);
     audioPlayer.src = url;
     downloadLink.href = url;
     resultEl.classList.add('show');
     resultEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return true;
+  }
+
+  async function runJob(j, apiKeys) {
+    const pendingIndices = j.chunks
+      .map((_, i) => i)
+      .filter(i => j.status[i] !== 'done');
+
+    let cursor = 0;
+    async function worker(apiKey) {
+      while (true) {
+        const myTurn = cursor++;
+        if (myTurn >= pendingIndices.length) return;
+        const idx = pendingIndices[myTurn];
+        j.status[idx] = 'in-progress';
+        renderProgress(j);
+        logLine(`Recording piece ${idx + 1} of ${j.chunks.length}…`);
+        try {
+          const prompt = buildPrompt(j.chunks[idx], j.notes);
+          const { bytes, sampleRate } = await callTTS(j.model, apiKey, prompt, j.voice, { pieceLabel: `Piece ${idx + 1}` });
+          j.results[idx] = { bytes, sampleRate };
+          j.status[idx] = 'done';
+          logLine(`Piece ${idx + 1} done.`, 'ok');
+        } catch (err) {
+          j.status[idx] = 'failed';
+          logLine(`Piece ${idx + 1} failed: ${err.message}`, 'err');
+        }
+        renderProgress(j);
+        // gentle pacing per key so a single key doesn't hammer the free tier
+        if (cursor < pendingIndices.length) await sleep(600);
+      }
+    }
+
+    // one worker per API key — they pull from the shared queue concurrently,
+    // so N keys process roughly N pieces at once instead of one at a time
+    await Promise.all(apiKeys.map(key => worker(key)));
+  }
+
+  goBtn.addEventListener('click', async () => {
+    if (isRunning) return;
+    showError('');
+
+    const text = textArea.value.trim();
+    const apiKeys = getApiKeys();
+    const model = modelSelect.value;
+    const voice = voiceSelect.value;
+    const notes = notesArea.value;
+
+    if (!text) { showError('Add some text first — paste it in, or upload a file above.'); return; }
+    if (!apiKeys.length) { showError('Paste at least one Gemini API key first. Get a free one at aistudio.google.com/apikey.'); return; }
+
+    if (rememberKey.checked) localStorage.setItem('ram_gemini_keys', JSON.stringify(apiKeys));
+
+    // start a fresh job only if the text changed since the last run —
+    // otherwise resume, so completed pieces are never redone
+    if (!job || job.sourceText !== text) {
+      job = buildFreshJob(text, notes, model, voice);
+      resultEl.classList.remove('show');
+      logEl.innerHTML = '';
+    } else {
+      job.notes = notes; job.model = model; job.voice = voice;
+    }
+
+    if (!job.chunks.length) { showError('Could not find any text to read.'); return; }
+
+    const { done, total } = jobCounts(job);
+    if (done === total) {
+      // everything already succeeded — just re-stitch the audio, no API calls needed
+      finalizeAudio(job);
+      return;
+    }
+
+    isRunning = true;
+    goBtn.disabled = true;
+    goBtn.textContent = '● Recording…';
+    stage.classList.add('spinning');
+    renderProgress(job);
+
+    await runJob(job, apiKeys);
+
+    stage.classList.remove('spinning');
+    goBtn.disabled = false;
+    isRunning = false;
+
+    const counts = jobCounts(job);
+    if (counts.failed > 0) {
+      goBtn.textContent = '↻ Retry failed pieces';
+      showError(`${counts.failed} of ${counts.total} piece${counts.total === 1 ? '' : 's'} failed. Fix the issue above (e.g. wait out a rate limit, check your key) and click "Retry failed pieces" — only the failed ones will be redone.`);
+      return;
+    }
+
+    goBtn.textContent = '▶ Start recording';
+    finalizeAudio(job);
   });
 
   resetBtn.addEventListener('click', () => {
+    job = null;
     resultEl.classList.remove('show');
     logEl.innerHTML = '';
     progressFill.style.width = '0%';
     counter.textContent = 'TAPE COUNTER · 000';
+    goBtn.textContent = '▶ Start recording';
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
+
 </script>
 </body>
 </html>
