@@ -6,6 +6,7 @@
 <title>Read-Aloud Mixtape — turn any file into one narrated track</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Work+Sans:wght@400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js"></script>
 <style>
   :root{
     --ink: #1B2430;
@@ -552,7 +553,7 @@
     <h2>🎧 Your track is ready</h2>
     <audio controls id="audioPlayer"></audio>
     <div class="result-actions">
-      <a class="btn-secondary btn-download" id="downloadLink" download="read-aloud.wav">⬇ Download audio (.wav)</a>
+      <a class="btn-secondary btn-download" id="downloadLink" download="read-aloud.mp3">⬇ Download audio (.mp3)</a>
       <button type="button" class="btn-secondary" id="resetBtn">Start another</button>
     </div>
   </section>
@@ -865,6 +866,24 @@
     return new Blob([buffer], { type: 'audio/wav' });
   }
 
+  function pcmToMp3Blob(pcmBytes, sampleRate, numChannels) {
+    // pcmBytes is raw 16-bit PCM (little-endian) — view it as Int16 samples for lamejs
+    const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
+    const mp3Encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, 128);
+    const blockSize = 1152; // multiple of 576, as recommended by lamejs
+    const mp3Chunks = [];
+    for (let i = 0; i < samples.length; i += blockSize) {
+      const chunk = samples.subarray(i, i + blockSize);
+      const mp3buf = numChannels === 1
+        ? mp3Encoder.encodeBuffer(chunk)
+        : mp3Encoder.encodeBuffer(chunk, chunk);
+      if (mp3buf.length > 0) mp3Chunks.push(new Uint8Array(mp3buf));
+    }
+    const endBuf = mp3Encoder.flush();
+    if (endBuf.length > 0) mp3Chunks.push(new Uint8Array(endBuf));
+    return new Blob(mp3Chunks, { type: 'audio/mpeg' });
+  }
+
   function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
   // --- Gemini TTS call with retry on rate limits ---
@@ -978,8 +997,8 @@
     if (orderedResults.some(r => !r)) return false;
     const sampleRate = orderedResults.find(r => r)?.sampleRate || 24000;
     const fullPcm = concatUint8Arrays(orderedResults.map(r => r.bytes));
-    const wavBlob = pcmToWavBlob(fullPcm, sampleRate, 1, 16);
-    const url = URL.createObjectURL(wavBlob);
+    const mp3Blob = pcmToMp3Blob(fullPcm, sampleRate, 1);
+    const url = URL.createObjectURL(mp3Blob);
     audioPlayer.src = url;
     downloadLink.href = url;
     resultEl.classList.add('show');
